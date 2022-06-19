@@ -963,6 +963,7 @@ class Unet(nn.Module):
         learned_sinu_pos_emb_dim = 16,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
+        cond_images_channels = 0,
         channels = 3,
         channels_out = None,
         attn_dim_head = 64,
@@ -988,7 +989,9 @@ class Unet(nn.Module):
         memory_efficient = False,
         init_conv_to_final_conv_residual = False,
         use_global_context_attn = True,
-        scale_resnet_skip_connection = True
+        scale_resnet_skip_connection = True,
+        final_resnet_block = True,
+        final_conv_kernel_size = 3
     ):
         super().__init__()
 
@@ -1007,6 +1010,7 @@ class Unet(nn.Module):
 
         self.lowres_cond = lowres_cond
 
+
         # determine dimensions
 
         self.channels = channels
@@ -1015,12 +1019,21 @@ class Unet(nn.Module):
         init_channels = channels if not lowres_cond else channels * 2 # in cascading diffusion, one concats the low resolution image, blurred, for conditioning the higher resolution synthesis
         init_dim = default(init_dim, dim)
 
+        # optional image conditioning
+
+        self.has_cond_image = cond_images_channels > 0
+        self.cond_images_channels = cond_images_channels
+
+        init_channels += cond_images_channels
+
+        # initial convolution
+
         self.init_conv = CrossEmbedLayer(init_channels, dim_out = init_dim, kernel_sizes = init_cross_embed_kernel_sizes, stride = 1)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        # time, image embeddings, and optional text encoding
+        # time conditioning
 
         cond_dim = default(cond_dim, dim)
         time_cond_dim = dim * 4 * (2 if lowres_cond else 1)
@@ -1188,10 +1201,12 @@ class Unet(nn.Module):
         self.init_conv_to_final_conv_residual = init_conv_to_final_conv_residual
         final_conv_dim = dim * (2 if init_conv_to_final_conv_residual else 1)
 
-        # final convolution
+        # final optional resnet block and convolution out
 
-        self.final_res_block = ResnetBlock(final_conv_dim, dim, time_cond_dim = time_cond_dim, groups = resnet_groups[0], skip_connection_scale = 1.)
-        self.final_conv = nn.Conv2d(dim, self.channels_out, 1)
+        self.final_res_block = ResnetBlock(final_conv_dim, dim, time_cond_dim = time_cond_dim, groups = resnet_groups[0], skip_connection_scale = 1., use_gca = True) if final_resnet_block else None
+
+        final_conv_dim_in = dim if final_resnet_block else final_conv_dim
+        self.final_conv = nn.Conv2d(final_conv_dim_in, self.channels_out, final_conv_kernel_size, padding = final_conv_kernel_size // 2)
 
     # if the current settings for the unet are not correct
     # for cascading DDPM, then reinit the unet with the right settings
@@ -1247,6 +1262,7 @@ class Unet(nn.Module):
         lowres_noise_times = None,
         text_embeds = None,
         text_mask = None,
+        cond_images = None,
         cond_drop_prob = 0.
     ):
         batch_size, device = x.shape[0], x.device
@@ -1258,6 +1274,15 @@ class Unet(nn.Module):
 
         if exists(lowres_cond_img):
             x = torch.cat((x, lowres_cond_img), dim = 1)
+
+        # condition on input image
+
+        assert not (self.has_cond_image ^ exists(cond_images)), 'you either requested to condition on an image on the unet, but the conditioning image is not supplied, or vice versa'
+
+        if exists(cond_images):
+            assert cond_images.shape[1] == self.cond_images_channels, 'the number of channels on the conditioning image you are passing in does not match what you specified on initialiation of the unet'
+            cond_images = resize_image_to(cond_images, x.shape[-1])
+            x = torch.cat((cond_images, x), dim = 1)
 
         # initial convolution
 
@@ -1397,7 +1422,9 @@ class Unet(nn.Module):
         if self.init_conv_to_final_conv_residual:
             x = torch.cat((x, init_conv_residual), dim = 1)
 
-        x = self.final_res_block(x, t)
+        if exists(self.final_res_block):
+            x = self.final_res_block(x, t)
+
         return self.final_conv(x)
 
 # predefined unets, with configs lining up with hyperparameters in appendix of paper
@@ -1467,6 +1494,7 @@ class Imagen(nn.Module):
         continuous_times = True,
         p2_loss_weight_gamma = 0.5,                 # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time
         p2_loss_weight_k = 1,
+        dynamic_thresholding = True,
         dynamic_thresholding_percentile = 0.9,      # unsure what this was based on perusal of paper
     ):
         super().__init__()
@@ -1577,6 +1605,7 @@ class Imagen(nn.Module):
 
         # dynamic thresholding
 
+        self.dynamic_thresholding = cast_tuple(dynamic_thresholding, num_unets)
         self.dynamic_thresholding_percentile = dynamic_thresholding_percentile
 
         # p2 loss weight
@@ -1621,10 +1650,10 @@ class Imagen(nn.Module):
         for unet, device in zip(self.unets, devices):
             unet.to(device)
 
-    def p_mean_variance(self, unet, x, t, *, noise_scheduler, text_embeds = None, text_mask = None, lowres_cond_img = None, lowres_noise_times = None, cond_scale = 1., model_output = None, t_next = None, pred_objective = 'noise'):
+    def p_mean_variance(self, unet, x, t, *, noise_scheduler, text_embeds = None, text_mask = None, cond_images = None, lowres_cond_img = None, lowres_noise_times = None, cond_scale = 1., model_output = None, t_next = None, pred_objective = 'noise', dynamic_threshold = True):
         assert not (cond_scale != 1. and not self.can_classifier_guidance), 'imagen was not trained with conditional dropout, and thus one cannot use classifier free guidance (cond_scale anything other than 1)'
 
-        pred = default(model_output, lambda: unet.forward_with_cond_scale(x, noise_scheduler.get_condition(t), text_embeds = text_embeds, text_mask = text_mask, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, lowres_noise_times = self.lowres_noise_schedule.get_condition(lowres_noise_times)))
+        pred = default(model_output, lambda: unet.forward_with_cond_scale(x, noise_scheduler.get_condition(t), text_embeds = text_embeds, text_mask = text_mask, cond_images = cond_images, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, lowres_noise_times = self.lowres_noise_schedule.get_condition(lowres_noise_times)))
 
         if pred_objective == 'noise':
             x_start = noise_scheduler.predict_start_from_noise(x, t = t, noise = pred)
@@ -1633,25 +1662,27 @@ class Imagen(nn.Module):
         else:
             raise ValueError(f'unknown objective {pred_objective}')
 
-        # following pseudocode in appendix
-        # s is the dynamic threshold, determined by percentile of absolute values of reconstructed sample per batch element
+        if dynamic_threshold:
+            # following pseudocode in appendix
+            # s is the dynamic threshold, determined by percentile of absolute values of reconstructed sample per batch element
+            s = torch.quantile(
+                rearrange(x_start, 'b ... -> b (...)').abs(),
+                self.dynamic_thresholding_percentile,
+                dim = -1
+            )
 
-        s = torch.quantile(
-            rearrange(x_start, 'b ... -> b (...)').abs(),
-            self.dynamic_thresholding_percentile,
-            dim = -1
-        )
-
-        s.clamp_(min = 1.)
-        s = right_pad_dims_to(x_start, s)
-        x_start = x_start.clamp(-s, s) / s
+            s.clamp_(min = 1.)
+            s = right_pad_dims_to(x_start, s)
+            x_start = x_start.clamp(-s, s) / s
+        else:
+            x_start.clamp_(-1., 1.)
 
         return noise_scheduler.q_posterior(x_start = x_start, x_t = x, t = t, t_next = t_next)
 
     @torch.no_grad()
-    def p_sample(self, unet, x, t, *, noise_scheduler, t_next = None, text_embeds = None, text_mask = None, cond_scale = 1., lowres_cond_img = None, lowres_noise_times = None, pred_objective = 'noise'):
+    def p_sample(self, unet, x, t, *, noise_scheduler, t_next = None, text_embeds = None, text_mask = None, cond_images = None, cond_scale = 1., lowres_cond_img = None, lowres_noise_times = None, pred_objective = 'noise', dynamic_threshold = True):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(unet, x = x, t = t, t_next = t_next, noise_scheduler = noise_scheduler, text_embeds = text_embeds, text_mask = text_mask, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, lowres_noise_times = lowres_noise_times, pred_objective = pred_objective)
+        model_mean, _, model_log_variance = self.p_mean_variance(unet, x = x, t = t, t_next = t_next, noise_scheduler = noise_scheduler, text_embeds = text_embeds, text_mask = text_mask, cond_images = cond_images, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, lowres_noise_times = lowres_noise_times, pred_objective = pred_objective, dynamic_threshold = dynamic_threshold)
         noise = torch.randn_like(x)
         # no noise when t == 0
         is_last_sampling_timestep = (t_next == 0) if isinstance(noise_scheduler, GaussianDiffusionContinuousTimes) else (t == 0)
@@ -1659,7 +1690,7 @@ class Imagen(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, unet, shape, *, noise_scheduler, lowres_cond_img = None, lowres_noise_times = None, text_embeds = None, text_mask = None, cond_scale = 1, pred_objective = 'noise'):
+    def p_sample_loop(self, unet, shape, *, noise_scheduler, lowres_cond_img = None, lowres_noise_times = None, text_embeds = None, text_mask = None, cond_images = None, cond_scale = 1, pred_objective = 'noise', dynamic_threshold = True):
         device = self.device
 
         batch = shape[0]
@@ -1676,11 +1707,13 @@ class Imagen(nn.Module):
                 t_next = times_next,
                 text_embeds = text_embeds,
                 text_mask = text_mask,
+                cond_images = cond_images,
                 cond_scale = cond_scale,
                 lowres_cond_img = lowres_cond_img,
                 lowres_noise_times = lowres_noise_times,
                 noise_scheduler = noise_scheduler,
-                pred_objective = pred_objective
+                pred_objective = pred_objective,
+                dynamic_threshold = dynamic_threshold
             )
 
         img.clamp_(-1., 1.)
@@ -1694,6 +1727,7 @@ class Imagen(nn.Module):
         texts: List[str] = None,
         text_masks = None,
         text_embeds = None,
+        cond_images = None,
         batch_size = 1,
         cond_scale = 1.,
         lowres_sample_noise_level = None,
@@ -1722,7 +1756,7 @@ class Imagen(nn.Module):
 
         lowres_sample_noise_level = default(lowres_sample_noise_level, self.lowres_sample_noise_level)
 
-        for unet_number, unet, channel, image_size, noise_scheduler, pred_objective in tqdm(zip(range(1, len(self.unets) + 1), self.unets, self.sample_channels, self.image_sizes, self.noise_schedulers, self.pred_objectives)):
+        for unet_number, unet, channel, image_size, noise_scheduler, pred_objective, dynamic_threshold in tqdm(zip(range(1, len(self.unets) + 1), self.unets, self.sample_channels, self.image_sizes, self.noise_schedulers, self.pred_objectives, self.dynamic_thresholding)):
 
             context = self.one_unet_in_gpu(unet = unet) if is_cuda else null_context()
 
@@ -1743,11 +1777,13 @@ class Imagen(nn.Module):
                     shape,
                     text_embeds = text_embeds,
                     text_mask = text_masks,
+                    cond_images = cond_images,
                     cond_scale = cond_scale,
                     lowres_cond_img = lowres_cond_img,
                     lowres_noise_times = lowres_noise_times,
                     noise_scheduler = noise_scheduler,
-                    pred_objective = pred_objective
+                    pred_objective = pred_objective,
+                    dynamic_threshold = dynamic_threshold
                 )
 
                 outputs.append(img)
@@ -1767,7 +1803,7 @@ class Imagen(nn.Module):
 
         return pil_images[output_index] # now you have a bunch of pillow images you can just .save(/where/ever/you/want.png)
 
-    def p_losses(self, unet, x_start, times, *, noise_scheduler, lowres_cond_img = None, lowres_aug_times = None, text_embeds = None, text_mask = None, noise = None, times_next = None, pred_objective = 'noise', p2_loss_weight_gamma = 0.):
+    def p_losses(self, unet, x_start, times, *, noise_scheduler, lowres_cond_img = None, lowres_aug_times = None, text_embeds = None, text_mask = None, cond_images = None, noise = None, times_next = None, pred_objective = 'noise', p2_loss_weight_gamma = 0.):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # normalize to [-1, 1]
@@ -1794,6 +1830,7 @@ class Imagen(nn.Module):
             noise_scheduler.get_condition(times),
             text_embeds = text_embeds,
             text_mask = text_mask,
+            cond_images = cond_images,
             lowres_noise_times = noise_scheduler.get_condition(lowres_aug_times),
             lowres_cond_img = lowres_cond_img_noisy,
             cond_drop_prob = self.cond_drop_prob,
@@ -1827,7 +1864,8 @@ class Imagen(nn.Module):
         texts: List[str] = None,
         text_embeds = None,
         text_masks = None,
-        unet_number = None
+        unet_number = None,
+        cond_images = None
     ):
         assert not (len(self.unets) > 1 and not exists(unet_number)), f'you must specify which unet you want trained, from a range of 1 to {len(self.unets)}, if you are training cascading DDPM (multiple unets)'
         unet_number = default(unet_number, 1)
@@ -1871,4 +1909,4 @@ class Imagen(nn.Module):
 
         images = resize_image_to(images, target_image_size)
 
-        return self.p_losses(unet, images, times, text_embeds = text_embeds, text_mask = text_masks, noise_scheduler = noise_scheduler, lowres_cond_img = lowres_cond_img, lowres_aug_times = lowres_aug_times, pred_objective = pred_objective, p2_loss_weight_gamma = p2_loss_weight_gamma)
+        return self.p_losses(unet, images, times, text_embeds = text_embeds, text_mask = text_masks, cond_images = cond_images, noise_scheduler = noise_scheduler, lowres_cond_img = lowres_cond_img, lowres_aug_times = lowres_aug_times, pred_objective = pred_objective, p2_loss_weight_gamma = p2_loss_weight_gamma)
